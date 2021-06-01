@@ -1,0 +1,1641 @@
+#NMA: Script to prepare data for dynamic weighted network meta-analysis, including
+#visualizaton routines.
+#
+#In order for this script to work, you must create a simple comma-delimited file that
+#includes information on interventions with at least two comparator arms. See the file
+#'test.csv' for an example. See below for a history of prior versions including bug
+#fixes and new features added.
+#
+#PRIMARY AUTHOR
+#Jeremy L. Warner MD, MS
+#Associate Professor of Medicine and Biomedical Informatics
+#Medical Director, Vanderbilt Cancer Registry and SCT Data Analysis Team
+#Vanderbilt University and Vanderbilt-Ingram Cancer Center
+#jeremy.warner@vanderbilt.edu
+#
+#CURRENT VERSION
+#Version 7.5.3 - November 2019
+#
+#This script is open source and may be used for any purpose. If you use the script
+#in whole or in part, please cite at least one of the following references:
+#
+#Warner J, Yang P, Alterovitz G. Automated synthesis and visualization of a
+#  chemotherapy treatment regimen network. Stud Health Technol Inform.
+#  2013;192:62-6. PubMed PMID: 23920516.
+#
+#Warner JL, Yang PC, Alterovitz G. Overcoming the straw man effect in oncology:
+#  Visualization and ranking of chemotherapy regimens using an information theoretic
+#  approach. JCO Clinical Cancer Informatics. 2017;1:1-9. doi: 10.1200/CCI.17.00079
+
+```{r, eval=TRUE}
+#Version number, for file naming
+v <- '7.5.4'
+
+require(igraph)
+require(RColorBrewer)
+
+#Default color pallette for node coloration
+pal <- brewer.pal(11, 'RdYlBu')
+
+#This parameter sets the aging decay, in years
+half.life <- 5.5
+
+#This parameter assigns 'relative value unit' to study types
+#Used prior to version 7.1: rvu.val <- c(1, 1.25, 1.5)
+rvu.val <- c(0.7, 0.8, 1)
+
+#This parameter assigns the background color for the graphs (future: variable background color)
+#bg.col.defined <- 'darkseagreen'
+bg.col.defined <- 'white'
+```
+
+#User chooses the context, here. 
+# 
+#Example: FL - 1 = Follicular lymphoma, untreated
+#
+#Important - directory needs to be set to the parent directory of where the input data is!
+#
+#Input data format (to be expanded)
+
+context <- 'FL - 1'
+context <- 'CML - 1'
+context <- 'RRMM'
+context <- 'MBC'
+context <- 'test'
+
+```{r, eval=FALSE}
+ # 3. years - a vector of years, first to last year of publication
+# 4. g: the graph data frame composed from edge.table and vertex.table
+######################################################################
+
+#Flag for whether to set edge value to "ideal" max RVU: ideal.edge.flag
+#Flag for whether to set p to "ideal" of 0.001: ideal.p.flag
+#Flag for whether to include p-value in the edge weight calculation: include.p.flag
+#Flag for whether to include effect size in the edge weight calculation: effect.size.flag
+#Flag for whether to devalue nodes: aging.flag
+#Flag for whether to propagate indirect evidence: prop.flag
+#Flag for whether to refresh edges when propagating evidence: refresh.flag
+#DEFAULT FOR ALL FLAGS IS FALSE
+
+make.tables <- function(context,
+                        filename = context,
+                        ideal.edge.flag = F,
+                        ideal.p.flag = F,
+                        include.p.flag = T,
+                        effect.size.flag = T,
+                        aging.flag = T,
+                        prop.flag = T,
+                        refresh.flag = T) {
+  #Load regimen list and determine edges
+  
+  #Generic file loader
+  foo <-
+    read.csv(paste(getwd(), '/', context, '/', filename, '.csv', sep = ''),
+             header = T,
+             stringsAsFactors = F)
+  
+  foo$effect.size[foo$effect.size == 'NR'] <- 1
+  foo$effect.size <- as.numeric(foo$effect.size)
+  
+  #Replace any NA pubs with "-"
+  foo$pub.2[is.na(foo$pub.2)] <- '-'
+  foo$pub.3[is.na(foo$pub.3)] <- '-'
+  foo$pub.4[is.na(foo$pub.4)] <- '-'
+    
+  foo$pub.2 <- as.numeric(foo$pub.2)
+  foo$pub.3 <- as.numeric(foo$pub.3)
+  foo$pub.4 <- as.numeric(foo$pub.4)
+  
+  #Replace NR in end of enrollment with pub.1 - 4 
+  foo$end_enrollment[foo$end_enrollment == 'NR'] <- foo$pub.1[foo$end_enrollment == 'NR'] - 4 
+  
+  #If p.flag is TRUE, reset p-values with p < 0.001 to 0.001 and NR to 1
+  if (include.p.flag)
+  {
+    foo$p[grep(foo$p, pattern = '<0.1')] <- .1 
+    foo$p[grep(foo$p, pattern = '<0.05')] <- .05 
+    foo$p[grep(foo$p, pattern = '<0.01')] <- .01 
+    foo$p[grep(foo$p, pattern = '<0.00')] <- .001
+    foo$p[grep(foo$p, pattern = '<0.000')] <- .0001 
+    foo$p[foo$p == 'NR'] <- 1
+    foo$p <- as.numeric(foo$p)
+    foo$p[foo$p <0.001] <- .001
+  }
+  
+  trials <- unique(foo$pmid)
+  
+  edge.table <- data.frame(
+    A = character(0),
+    B = character(0),
+    A.pt = integer(0),
+    B.pt = integer(0),
+    A.val = integer(0),
+    B.val = integer(0),
+    end_enrollment = integer(0),
+    pub.1 = numeric(0),
+    pub.2 = numeric(0),
+    pub.3 = numeric(0),
+    pub.4 = numeric(0),
+    comp = character(0),
+    p = numeric(0),
+    e.size = numeric(0),
+    stringsAsFactors = F
+  )
+  
+  for (n in 1:length(trials))
+  {
+    temp.ref <- which(foo$pmid %in% trials[n])
+    
+    for (i in 1:length(temp.ref))
+    {
+      edge.table[dim(edge.table)[1] + 1, ] <- NA
+      edge.table$A[dim(edge.table)[1]] <- foo$Regimen.1[temp.ref[i]]
+      edge.table$B[dim(edge.table)[1]] <- foo$Regimen.2[temp.ref[i]]
+      edge.table$A.pt[dim(edge.table)[1]] <- foo$Patients.1[temp.ref[i]]
+      edge.table$B.pt[dim(edge.table)[1]] <- foo$Patients.2[temp.ref[i]]
+      edge.table$A.val[dim(edge.table)[1]] <- 1
+      edge.table$B.val[dim(edge.table)[1]] <- -1
+      edge.table$end_enrollment[dim(edge.table)[1]] <- foo$end_enrollment[temp.ref[i]]
+      edge.table$pub.1[dim(edge.table)[1]] <- foo$pub.1[temp.ref[i]]
+      edge.table$pub.2[dim(edge.table)[1]] <- foo$pub.2[temp.ref[i]]
+      edge.table$pub.3[dim(edge.table)[1]] <- foo$pub.3[temp.ref[i]]
+      edge.table$pub.4[dim(edge.table)[1]] <- foo$pub.4[temp.ref[i]]
+      edge.table$comp[dim(edge.table)[1]] <- foo$Comparison[temp.ref[i]]
+      if (include.p.flag)
+      {
+        edge.table$p[dim(edge.table)[1]] <- foo$p[temp.ref[i]]
+      }
+      else
+        edge.table$p[dim(edge.table)[1]] <- 1
+      if (effect.size.flag)
+      {
+        edge.table$e.size[dim(edge.table)[1]] <- foo$effect.size[temp.ref[i]]
+        
+      }
+      else
+        edge.table$e.size[dim(edge.table)[1]] <- 1
+    }
+  }
+  
+  #If p.flag iS TRUE, replace p-value with -log10(p-value)
+  if (include.p.flag)
+  {
+    edge.table$p <- -log10(edge.table$p)
+    #If ideal.p.flag set to TRUE, replace with -log10(0.001)
+    if (ideal.p.flag)
+      edge.table$p <- -log10(0.001)
+  }
+  
+  #QC step - remove rows that don't meet criteria
+  edge.table <- edge.table[edge.table$A != '' & edge.table$B != '',]
+  edge.table <- edge.table[!(is.na(edge.table$comp)|
+                               is.na(edge.table$p)|
+                               is.na(edge.table$e.size)
+                             ),]
+  
+  #Rearrange edges by year, for later legend
+  #edge.table <- edge.table[order(edge.table$pub.1), ]
+  edge.table <- edge.table[order(edge.table$end_enrollment),]
+  
+  #Calculate edge color
+  edge.table$e.color <- 0
+  edge.table$e.color[which(edge.table$comp %in% c('ORR','RR','CBR','CRR','DCR'))] <- pal[1] #'Red'
+  edge.table$e.color[which(edge.table$comp %in% c('PFS','PFS12','PFS6','TTP','TTNT','TTF','TTD'))] <-
+    pal[6] #'Yellow' 
+  edge.table$e.color[which(edge.table$comp == 'OS')] <-
+    pal[11] #'Green'
+  
+  edge.table$rvu <- 0
+  edge.table$rvu[which(edge.table$comp %in% c('ORR','RR','CBR','CRR','DCR'))] <- rvu.val[1]
+  edge.table$rvu[which(edge.table$comp %in% c('PFS','PFS12','PFS6','TTP','TTNT','TTF','TTD'))] <- rvu.val[2] 
+  edge.table$rvu[which(edge.table$comp == 'OS')] <- rvu.val[3]
+  
+  #FLAG: set all relatve value units to "ideal" rvu
+  if (ideal.edge.flag)
+    edge.table$rvu <- rvu.val[3]
+  
+  #Determine whether the edge is present in any given year
+  #years <- min(edge.table$pub.1):as.numeric(substr(Sys.Date(), start = 0, stop = 4))
+  years <- min(edge.table$end_enrollment):2019
+  
+  temp.years <-
+    data.frame(matrix(
+      data = 0,
+      nrow = dim(edge.table)[1],
+      ncol = length(years)
+    ), stringsAsFactors = F)
+  colnames(temp.years) <- paste('e.', years, sep = '')
+  
+  for (i in 1:length(years)){
+    #temp.years[, i] <- edge.table$pub.1 <= years[i]
+    temp.years[, i] <- edge.table$end_enrollment <= years[i]
+  }
+  
+  edge.table <- cbind(edge.table, temp.years)
+  
+  #Second, determine edge value (for the winning side of the edge)
+  #multiply log(patients)*rvu*outcome (win=1,lose=-1,tie=0)
+  temp.years <-
+    data.frame(matrix(
+      data = 0,
+      nrow = dim(edge.table)[1],
+      ncol = length(years)
+    ), stringsAsFactors = F)
+  colnames(temp.years) <- paste('val.', years, sep = '')
+  
+  wt <-
+    abs(
+      log10(edge.table$A.pt + edge.table$B.pt) * edge.table$A.val * edge.table$rvu *
+        edge.table$p * edge.table$e.size
+    )
+  
+  for (i in 1:length(years))
+  {
+    ref <- c(which(colnames(edge.table) == paste('e.', years[i], sep = '')))
+    
+    temp.years[, i] <- wt * edge.table[, ref]
+    
+  }
+  
+  edge.table <- cbind(edge.table, temp.years)
+  
+  #Third, assign alpha (aging) to edges
+  temp1 <-
+    data.frame(matrix(
+      data = 0,
+      nrow = dim(edge.table)[1],
+      ncol = length(years)
+    ), stringsAsFactors = F)
+  colnames(temp1) <- paste('alpha.', years, sep = '')
+  
+  # Start exponential decay at end of enrollment 
+  for (i in 1:dim(edge.table)[1])
+  {
+    temp2 <- which(years %in% edge.table$end_enrollment[i])
+    
+    #Exponential decay function
+    temp3 <- rep(1, length(years) - temp2 + 1)
+    if (length(temp3) > 1)
+      for (j in 2:length(temp3))
+        temp3[j] <- temp3[j - 1] * 0.5 ^ (1 / half.life)
+    
+    temp1[i, temp2:dim(temp1)[2]] <- temp3
+  }
+  
+  for (i in 1:dim(edge.table)[1])
+  {
+    temp2 <- which(years %in% edge.table$pub.1[i])
+    temp3 <- min((temp1[i, temp2]) * 2, 1)
+    
+    #Exponential decay function
+    temp4 <- rep(temp3, length(years) - temp2 + 1)
+    if (length(temp4) > 1)
+      for (j in 2:length(temp4))
+        temp4[j] <- temp4[j - 1] * 0.5 ^ (1 / half.life)
+    
+    temp1[i, temp2:dim(temp1)[2]] <- temp4
+  }
+  
+  #If there is an update publication, refresh alpha x2 (to a maximum of 1)
+  if (sum(which(edge.table$pub.2 > edge.table$pub.1)) > 0)
+  {
+    for (i in which(edge.table$pub.2 > edge.table$pub.1))
+    {
+      temp2 <- which(years %in% edge.table$pub.2[i])
+      temp3 <- min((temp1[i, temp2]) * 2, 1)
+      
+      #Exponential decay function
+      temp4 <- rep(temp3, length(years) - temp2 + 1)
+      if (length(temp4) > 1)
+        for (j in 2:length(temp4))
+          temp4[j] <- temp4[j - 1] * 0.5 ^ (1 / half.life)
+      
+      temp1[i, temp2:dim(temp1)[2]] <- temp4
+    }
+  }
+  
+  #If there is a 2nd update publication, refresh alpha x2 (to a maximum of 1)
+  if (sum(which(edge.table$pub.3 > edge.table$pub.2)) > 0)
+  {
+    for (i in which(edge.table$pub.3 > edge.table$pub.2))
+    {
+      temp2 <- which(years %in% edge.table$pub.3[i])
+      temp3 <- min((temp1[i, temp2]) * 2, 1)
+      
+      #Exponential decay function
+      temp4 <- rep(temp3, length(years) - temp2 + 1)
+      if (length(temp4) > 1)
+        for (j in 2:length(temp4))
+          temp4[j] <- temp4[j - 1] * 0.5 ^ (1 / half.life)
+      
+      temp1[i, temp2:dim(temp1)[2]] <- temp4
+    }
+  }
+  
+  #If there is a 3rd update publication, refresh alpha x2 (to a maximum of 1)
+  if (sum(which(edge.table$pub.4 > edge.table$pub.3)) > 0)
+  {
+    for (i in which(edge.table$pub.4 > edge.table$pub.3))
+    {
+      temp2 <- which(years %in% edge.table$pub.4[i])
+      temp3 <- min((temp1[i, temp2]) * 2, 1)
+      
+      #Exponential decay function
+      temp4 <- rep(temp3, length(years) - temp2 + 1)
+      if (length(temp4) > 1)
+        for (j in 2:length(temp4))
+          temp4[j] <- temp4[j - 1] * 0.5 ^ (1 / half.life)
+      
+      temp1[i, temp2:dim(temp1)[2]] <- temp4
+    }
+  }
+  
+  #Replace all aging if aging.flag is FALSE
+  if (!aging.flag)
+    temp1[1:dim(temp1)[1], 1:dim(temp1)[2]] <- 1
+  
+  edge.table <- cbind(edge.table, temp1)
+  
+  ###############
+  #Create vertex.table
+  ###############
+  vertex.table <-
+    data.frame(regimen = unique(c(edge.table$A, edge.table$B)), stringsAsFactors =
+                 F)
+  
+  # vertex.table$latest <- 0
+  # for (i in 1:dim(vertex.table)[1])
+  #   vertex.table$latest[i] <-
+  #   max(edge.table$pub.2[edge.table$A == vertex.table$regimen[i] |
+  #                          edge.table$B == vertex.table$regimen[i]])
+  
+  #End of enrollment of First publication for each node
+  vertex.table$first <- 0
+  for (i in 1:dim(vertex.table)[1])
+    vertex.table$first[i] <-
+    min(edge.table$end_enrollment[edge.table$A == vertex.table$regimen[i] |
+                           edge.table$B == vertex.table$regimen[i]])
+  
+  #Rearrange nodes by year, for later legend
+  vertex.table <-
+    vertex.table[order(vertex.table$first), ] #First publication for each node
+  
+  #Calculate base node size
+  vertex.table$size <- 0
+  for (i in 1:nrow(vertex.table))
+  {
+    temp.ref <- which(foo$Regimen.1 == vertex.table$regimen[i]|foo$Regimen.2 == vertex.table$regimen[i])
+    temp <- unique(foo$pmid[temp.ref])
+    for(j in 1:length(temp))
+    {
+      temp.ref2 <- which(foo$pmid == temp[j])
+      if(any(foo$Regimen.1[temp.ref2] == vertex.table$regimen[i]))
+        vertex.table$size[i] <- vertex.table$size[i] + foo$Patients.1[temp.ref2[which(foo$Regimen.1[temp.ref2] == vertex.table$regimen[i])]][1] else
+          vertex.table$size[i] <- vertex.table$size[i] + foo$Patients.2[temp.ref2[which(foo$Regimen.2[temp.ref2] == vertex.table$regimen[i])]][1]
+        
+    }
+  }
+    
+  #Generate a table of regimens ordered by size (descending)
+  regimens <- vertex.table[order(vertex.table$size, decreasing = T), ]
+  
+  #Save a CSV with the list of regimens in descending order by size
+  write.csv(regimens, file = paste(context, ' regimens.', v, '.csv', sep =
+                                     ''))
+  
+  #############
+  #Build a list of the temporal graphs
+  #############
+  
+  temp.size <-
+    data.frame(matrix(
+      data = 0,
+      nrow = dim(vertex.table)[1],
+      ncol = length(years)
+    ), stringsAsFactors = F)
+  colnames(temp.size) <- paste('size.', years, sep = '')
+  
+  #Calculate node size for each year, starting from end of enrollment
+  for (i in 1:length(years))
+    for (j in 1:dim(vertex.table)[1])
+      temp.size[j, i] <-
+    sum(foo$Patients.1[which(foo$Regimen.1 == vertex.table$regimen[j] & foo$end_enrollment <= years[i])]) +
+    sum(foo$Patients.2[which(foo$Regimen.2 == vertex.table$regimen[j] & foo$end_enrollment <= years[i])])
+  
+  vertex.table <- cbind(vertex.table, temp.size)
+  
+  #Calculate node value and alpha
+  
+  temp.val <-
+    data.frame(matrix(
+      data = 0,
+      nrow = dim(vertex.table)[1],
+      ncol = length(years)
+    ), stringsAsFactors = F)
+  colnames(temp.val) <- paste('val.', years, sep = '')
+  
+  temp.alpha <-
+    data.frame(matrix(
+      data = 0,
+      nrow = dim(vertex.table)[1],
+      ncol = length(years)
+    ), stringsAsFactors = F)
+  colnames(temp.alpha) <- paste('alpha.', years, sep = '')
+  
+  for (i in 1:length(years))
+  {
+    #Make a reference list for year-specific column names
+    #1. edge.table$e.yyyy
+    #2. vertex.table$size.yyyy
+    #3. edge.table$alpha.yyyy
+    #4. edge.table$val.yyyy
+    
+    ref <- c(
+      which(colnames(edge.table) == paste('e.', years[i], sep = '')),
+      which(colnames(vertex.table) == paste('size.', years[i], sep = '')),
+      which(colnames(edge.table) == paste('alpha.', years[i], sep = '')),
+      which(colnames(edge.table) == paste('val.', years[i], sep = ''))
+    )
+    
+    g <-
+      graph.data.frame(
+        cbind(edge.table$A[edge.table[, ref[1]]], edge.table$B[edge.table[, ref[1]]]),
+        directed = F,
+        vertices = vertex.table[which(vertex.table[, ref[2]] != 0),]
+      )
+    
+    x <- unique(c(edge.table$A[edge.table[, ref[1]]], edge.table$B[edge.table[, ref[1]]]))
+    x1 <- vertex.table$regimen[which(vertex.table[, ref[2]] != 0)]
+      
+    for (j in 1:vcount(g))
+    {
+      #Get the incident edges
+      temp2 <- incident(g, j)
+      
+      #Value gained by winning
+      winners <-
+        temp2[which(edge.table$A[temp2] %in% vertex.table$regimen[j])]
+      temp.val[j, i] <-
+        temp.val[j, i] + sum(edge.table[winners, ref[4]] * edge.table[winners, ref[3]])
+      
+      #Value lost by losing
+      losers <-
+        temp2[which(edge.table$B[temp2] %in% vertex.table$regimen[j])]
+      temp.val[j, i] <-
+        temp.val[j, i] - sum(edge.table[losers, ref[4]] * edge.table[losers, ref[3]])
+      
+      #Node alpha, for graphics later
+      total <- rowSums(edge.table[c(winners, losers), c('A.pt', 'B.pt')])
+      temp.alpha[j, i] <-
+        sum(total * edge.table[c(winners, losers), ref[3]]) / sum(total)
+      
+    }
+  }
+  
+  vertex.table <- cbind(vertex.table, temp.val, temp.alpha)
+  
+  #If prop.flag = TRUE, recalculate all values using propagation routines
+  if (prop.flag)
+  {
+    prop.temp <-
+      data.frame(matrix(
+        data = 0,
+        nrow = dim(edge.table)[1],
+        ncol = length(years)
+      ),
+      stringsAsFactors = F)
+    colnames(prop.temp) <- paste('prop.', years, sep = '')
+    
+    e.start <-
+      which(colnames(edge.table) == paste('alpha.', min(years), sep = ''))
+    e.stop <-
+      which(colnames(edge.table) == paste('alpha.', max(years), sep = ''))
+    refresh.temp <- edge.table[, e.start:e.stop]
+    
+    #data.frame(matrix(data=0, nrow=dim(edge.table)[1], ncol=length(years)), stringsAsFactors=F)
+    colnames(refresh.temp) <- paste('alpha.', years, sep = '')
+    
+    for (i in 2:length(years))
+    {
+      #Make a reference list for year-specific column names
+      #1. vertex.table$val.yyyy
+      #2. edge.table$e.yyyy
+      #3. edge.table$alpha.yyyy
+      #4. edge.table$val.yyyy
+      
+      ref <-
+        c(
+          which(colnames(vertex.table) == paste('size.', years[i], sep = '')),
+          which(colnames(edge.table) == paste('e.', years[i], sep = '')),
+          which(colnames(edge.table) == paste('alpha.', years[i], sep = '')),
+          which(colnames(edge.table) == paste('val.', years[i], sep = ''))
+        )
+      
+      delta <- edge.table[, ref[4]] - edge.table[, (ref[4] - 1)]
+      
+      g <-
+        graph.data.frame(
+          cbind(edge.table$A[edge.table[, ref[2]]], edge.table$B[edge.table[, ref[2]]]),
+          directed = F,
+          vertices = vertex.table[1:sum(vertex.table[, ref[1]] != 0), ]
+        )
+      
+      g.1 <-
+        graph.data.frame(
+          cbind(edge.table$A[edge.table[, (ref[2] - 1)]], edge.table$B[edge.table[, (ref[2] -
+                                                                                       1)]]),
+          directed = F,
+          vertices = vertex.table[1:sum(vertex.table[, (ref[1] - 1)] != 0), ]
+        )
+      
+      for (j in which(delta != 0))
+      {
+        winner <- which(vertex.table$regimen %in% edge.table$A[j])
+        loser <- which(vertex.table$regimen %in% edge.table$B[j])
+        
+        #Calculate old and new winner power to determine sharing
+        winner.phi.new <- 0
+        winner.phi.old <- 0
+        
+        temp2 <- incident(g, winner)
+        winner.phi.new <-
+          sum(edge.table[temp2, ref[4]] * refresh.temp[temp2, i])
+        
+        #Old winner power
+        if (vcount(g.1) >= winner)
+        {
+          temp2 <- incident(g.1, winner)
+          winner.phi.old <-
+            sum(edge.table[temp2, (ref[4] - 1)] * refresh.temp[temp2, (i - 1)])
+        }
+        
+        #Calculate old and new loser power to determine sharing
+        loser.phi.new <- 0
+        loser.phi.old <- 0
+        
+        temp2 <- incident(g, loser)
+        loser.phi.new <-
+          sum(edge.table[temp2, ref[4]] * refresh.temp[temp2, i])
+        
+        #Old loser power
+        if (vcount(g.1) >= loser)
+        {
+          temp2 <- incident(g.1, loser)
+          loser.phi.old <-
+            sum(edge.table[temp2, (ref[4] - 1)] * refresh.temp[temp2, (i - 1)])
+        }
+        
+        #First, share the gains of the winner
+        temp.e <- incident(g, winner)
+        temp.e <- temp.e[!temp.e %in% which(delta != 0)]
+        
+        if (length(temp.e) > 0)
+        {
+          #Determine whether the winner lost against any of its predescessors
+          temp.val <- numeric(0)
+          for (k in 1:length(temp.e))
+            temp.val[k] <-
+              edge.table[temp.e[k], c('A.val', 'B.val')][edge.table[temp.e[k], c('A', 'B')]
+                                                         == vertex.table$regimen[winner]]
+          
+          temp.e <- temp.e[which(temp.val == -1)]
+        }
+        
+        
+        #Only propagate if there is at least one edge left
+        if (length(temp.e) > 0)
+        {
+          #Winner gets to pass along value based on power change
+          temp2 <- winner.phi.old / (winner.phi.old + winner.phi.new)
+          temp3 <-
+            rowSums(edge.table[temp.e, c('A.pt', 'B.pt')]) / sum(edge.table[temp.e, c('A.pt', 'B.pt')])
+          temp2 <- temp2 * temp3 * delta[j]
+          
+          #If refresh flag = TRUE, refresh edges by x2
+          if (refresh.flag)
+          {
+            refresh.temp[temp.e, i] <- 2 * refresh.temp[temp.e, i]
+            refresh.temp[temp.e, ][refresh.temp[temp.e, ] > 1] <- 1
+            
+            #Re-introduce decay for the refreshed nodes
+            if (length(years) - i > 0)
+              for (k in 1:length(temp.e))
+              {
+                temp4 <- rep(refresh.temp[temp.e[k], i], length(years) - i + 1)
+                
+                for (l in 2:length(temp4))
+                  temp4[l] <- temp4[l - 1] * 0.5 ^ (1 / half.life)
+                refresh.temp[temp.e[k], i:dim(refresh.temp)[2]] <- temp4
+              }
+          }
+          
+          #Add aliquots to neighbors and propagate forward
+          for (k in 1:length(temp.e))
+            prop.temp[temp.e[k], i:dim(prop.temp)[2]] <-
+            prop.temp[temp.e[k], i:dim(prop.temp)[2]] + temp2[k] * refresh.temp[temp.e[k], i]
+          
+        }
+        
+        #Second, share the losses of the loser
+        temp.e <- incident(g, loser)
+        temp.e <- temp.e[!temp.e %in% which(delta != 0)]
+        
+        if (length(temp.e) > 0)
+        {
+          #Determine whether the loser beat any of its predescessors
+          temp.val <- numeric(0)
+          for (k in 1:length(temp.e))
+            temp.val[k] <-
+              edge.table[temp.e[k], c('A.val', 'B.val')][edge.table[temp.e[k], c('A', 'B')]
+                                                         == vertex.table$regimen[loser]]
+          
+          temp.e <- temp.e[which(temp.val == 1)]
+          
+          #Find older generations
+          loser.2 <-
+            which(vertex.table$regimen %in% unique(edge.table$B[temp.e]))
+          temp.e.2 <- incident(g, loser.2)
+          temp.e.2 <- temp.e.2[!incident(g, loser.2) %in% temp.e]
+          temp.e.2 <-
+            temp.e.2[edge.table$A[temp.e.2] %in% vertex.table$regimen[loser.2] &
+                       edge.table$B.val[temp.e.2] == -1]
+          
+        }
+        
+        #Only propagate if there is at least one edge left
+        if (length(temp.e) > 0)
+        {
+          #Determine the aliquots to be shared with the neighbors
+          
+          #Loser gets to pass along value based on relative size
+          temp2 <- loser.phi.old / (loser.phi.old + loser.phi.new)
+          temp3 <-
+            rowSums(edge.table[temp.e, c('A.pt', 'B.pt')]) / sum(edge.table[temp.e, c('A.pt', 'B.pt')])
+          temp2 <- temp2 * temp3 * delta[j]
+          
+          #If refresh flag = TRUE, refresh edges by x2
+          if (refresh.flag)
+          {
+            refresh.temp[temp.e, i] <- 2 * refresh.temp[temp.e, i]
+            refresh.temp[temp.e, ][refresh.temp[temp.e, ] > 1] <- 1
+            
+            #Re-introduce decay for the refreshed nodes
+            if (length(years) - i > 0)
+              for (k in 1:length(temp.e))
+              {
+                temp4 <- rep(refresh.temp[temp.e[k], i], length(years) - i + 1)
+                
+                for (l in 2:length(temp4))
+                  temp4[l] <- temp4[l - 1] * 0.5 ^ (1 / half.life)
+                refresh.temp[temp.e[k], i:dim(refresh.temp)[2]] <- temp4
+              }
+          }
+          
+          #Add aliquots to neighbors and propagate forward
+          for (k in 1:length(temp.e))
+          {
+            prop.temp[temp.e[k], i:dim(prop.temp)[2]] <-
+              prop.temp[temp.e[k], i:dim(prop.temp)[2]] + temp2[k] * refresh.temp[temp.e[k], i]
+            
+            if (length(temp.e.2) > 100)
+              for (l in 1:length(temp.e.2))
+              {
+                temp3 <-
+                  edge.table$A.pt[temp.e.2[l]] / sum(edge.table[temp.e.2[l], c('A.pt', 'B.pt')])
+                temp3 <- temp3 * temp2[k] * refresh.temp[temp.e[k], i]
+                prop.temp[temp.e.2[l], i:dim(prop.temp)[2]] <-
+                  prop.temp[temp.e.2[l], i:dim(prop.temp)[2]] + temp3 * refresh.temp[temp.e.2[l], i]
+              }
+          }
+        }
+      }
+    }
+    
+    #Replace the alpha values with the refreshed values
+    edge.table[, e.start:e.stop] <- refresh.temp
+    
+    #Add propagation values back into the value matrix
+    e.start <-
+      which(colnames(edge.table) == paste('val.', min(years), sep = ''))
+    e.stop <-
+      which(colnames(edge.table) == paste('val.', max(years), sep = ''))
+    edge.table[, e.start:e.stop] <-
+      edge.table[, e.start:e.stop] + prop.temp
+    
+    #Recalculate node values
+    temp.val <-
+      data.frame(matrix(
+        data = 0,
+        nrow = dim(vertex.table)[1],
+        ncol = length(years)
+      ),
+      stringsAsFactors = F)
+    colnames(temp.val) <- paste('val.', years, sep = '')
+    
+    temp.alpha <-
+      data.frame(matrix(
+        data = 0,
+        nrow = dim(vertex.table)[1],
+        ncol = length(years)
+      ),
+      stringsAsFactors = F)
+    colnames(temp.alpha) <- paste('alpha.', years, sep = '')
+    
+    for (i in 1:length(years))
+    {
+      #Make a reference list for year-specific column names
+      #1. edge.table$e.yyyy
+      #2. vertex.table$size.yyyy
+      #3. edge.table$alpha.yyyy
+      #4. edge.table$val.yyyy
+      
+      ref <- c(
+        which(colnames(edge.table) == paste('e.', years[i], sep = '')),
+        which(colnames(vertex.table) == paste('size.', years[i], sep = '')),
+        which(colnames(edge.table) == paste('alpha.', years[i], sep = '')),
+        which(colnames(edge.table) == paste('val.', years[i], sep = ''))
+      )
+      
+      g <-
+        graph.data.frame(
+          cbind(edge.table$A[edge.table[, ref[1]]], edge.table$B[edge.table[, ref[1]]]),
+          directed = F,
+          vertices = vertex.table[1:sum(vertex.table[, ref[2]] != 0), ]
+        )
+      
+      for (j in 1:vcount(g))
+      {
+        #Get the incident edges
+        temp2 <- incident(g, j)
+        
+        #Value gained by winning
+        winners <-
+          temp2[which(edge.table$A[temp2] %in% vertex.table$regimen[j])]
+        temp.val[j, i] <-
+          temp.val[j, i] + sum(edge.table[winners, ref[4]] * edge.table[winners, ref[3]])
+        
+        #Value lost by losing
+        losers <-
+          temp2[which(edge.table$B[temp2] %in% vertex.table$regimen[j])]
+        temp.val[j, i] <-
+          temp.val[j, i] - sum(edge.table[losers, ref[4]] * edge.table[losers, ref[3]])
+        
+        #Node alpha, for graphics later
+        total <- rowSums(edge.table[c(winners, losers), c('A.pt', 'B.pt')])
+        temp.alpha[j, i] <-
+          sum(total * edge.table[c(winners, losers), ref[3]]) / sum(total)
+        
+      }
+    }
+    
+    v.start <-
+      which(colnames(vertex.table) == paste('val.', min(years), sep = ''))
+    v.stop <-
+      which(colnames(vertex.table) == paste('val.', max(years), sep = ''))
+    vertex.table[, v.start:v.stop] <- temp.val
+    
+    v.start <-
+      which(colnames(vertex.table) == paste('alpha.', min(years), sep = ''))
+    v.stop <-
+      which(colnames(vertex.table) == paste('alpha.', max(years), sep = ''))
+    vertex.table[, v.start:v.stop] <- temp.alpha
+    
+    
+    #End of propagation routine
+  }
+  
+  #Add a number to each node for legend usage
+  vertex.table$num <- 1:dim(vertex.table)[1]
+  
+  #Create the full iGraph object
+  g <- graph.data.frame(edge.table[, c('A', 'B')],
+                        directed = F,
+                        vertices = vertex.table)
+  
+  #Order the edge and vertex tables
+  
+  #Vertices - order by value in the final year, decreasing
+  temp <- tail(grep(colnames(vertex.table), pattern = '^val'), n = 1L)
+  vertex.table <- vertex.table[order(vertex.table[,temp], decreasing = T),]
+  
+  #Return results to an R object, if it is declared
+  return(list(
+    edge.table = edge.table,
+    vertex.table = vertex.table,
+    years = years,
+    graph = g
+  ))
+  
+  #Create a directory and deposit results there
+  temp <- paste(context, v)
+  if(!dir.exists(paste(getwd(), '/', context, '/', temp, sep = '')))
+  {
+    dir.create(paste(getwd(), '/', context, '/', temp, sep = ''))
+    save(edge.table,
+         vertex.table,
+         years,
+         g,
+         file = paste(getwd(), '/', context, '/', temp, '/', 'tables.RData', sep=''))
+  } else save(edge.table,
+         vertex.table,
+         years,
+         g,
+         file = paste(getwd(), '/', context, '/', temp, '/', 'tables.RData', sep=''))
+  
+}
+```
+
+#############
+#Graph Layout - NOT FUNCTIONALIZED
+#############
+
+#Create the tables, at this point flags don't matter so they're mostly off
+foo <- make.tables(context,
+                   ideal.edge.flag = T,
+                   ideal.p.flag = T,
+                   include.p.flag = F,
+                   effect.size.flag = F,
+                   aging.flag = F,
+                   prop.flag = F,
+                   refresh.flag = F)
+
+#Extract the contents of the list foo
+edge.table <- foo[[1]]
+vertex.table <- foo[[2]]
+years <- foo[[3]]
+g <- foo[[4]]
+
+# save vertex table to an csv file and manually put in the frame color (regimen types)
+
+```{r}
+#Run tkplot in order to set the layout
+#
+#**If you don't have xcode installed on Mac, using tkplot will cause your R
+#   instance to hang with the following error:
+#     xcrun: error: invalid active developer path 
+#      (/Library/Developer/CommandLineTools), 
+#     missing xcrun at: /Library/Developer/CommandLineTools/usr/bin/xcrun
+#
+#In order to avoid this, run this in terminal: xcode-select --install
+#
+#You also need to have XQuartz installed (xquartz.macosforge.org)
+
+################################################
+
+#You only need this package if you're going to use tkplot:
+require(tcltk2)
+
+#Just make a quick-and-dirty force-based layout, without using tkplot
+layout.foo <- layout_with_kk(g)
+layout.foo <- layout_with_fr(g)
+  
+#Create the full iGraph object
+g <- graph.data.frame(edge.table[, c('A', 'B')],
+                      directed = F,
+                      vertices = vertex.table)
+
+g.c <- autocurve.edges(g, start = 0.25)
+
+#Start with force graphing
+temp.layout <- tkplot(
+  g,
+  layout = layout.fruchterman.reingold,
+  vertex.size = sqrt(vertex.table$size),
+  vertex.label = vertex.table$regimen,
+  edge.curved = g.c,
+)
+
+```
+
+```{r}
+#Do not close the tkplot window before getting the coordinates!!!
+layout.foo <- tkplot.getcoords(temp.layout)
+
+#Save the layout
+save(layout.foo, file = paste(context, '.layout.', v, '.RData', sep = ''))
+```
+
+#Recursive improvements to graph layout
+
+#Load the layout
+load(file = paste(context, '.layout.', v, '.RData', sep = ''))
+
+```{r}
+temp.layout <- tkplot(
+  g,
+  layout = layout.foo,
+  vertex.size = sqrt(vertex.table$size),
+  vertex.label = vertex.table$regimen,
+  edge.curved = g.c
+)
+```
+
+#Do not close the tkplot window before getting the coordinates!!!
+layout.foo <- tkplot.getcoords(temp.layout)
+
+###################
+#Graphics Functions
+###################
+
+```{r, eval=FALSE}
+###################
+#Generate all graphs, one per year. Need to specify the make.tables object
+###################
+
+#Temporary fix
+# make sure to load the vertex.table.csv file with the node frame color -> vertex_table
+for(i in 4:dim(vertex.table)[2])
+  vertex.table[,i][is.na(vertex.table[,i])] <- 0
+
+make.graphs <- function(object, first = 1,
+                        last = length(years)) {
+  
+  edge.table <- foo[[1]]
+  vertex.table <- foo[[2]]
+  years <- foo[[3]]
+  g <- foo[[4]]
+  
+  
+  for (i in first:last)
+  {
+    ref <- c(
+      which(colnames(edge.table) == paste('e.', years[i], sep = '')),
+      which(colnames(vertex.table) == paste('size.', years[i], sep = '')),
+      which(colnames(vertex.table) == paste('val.', years[i], sep = '')),
+      which(colnames(vertex.table) == paste('alpha.', years[i], sep = '')),
+      which(colnames(edge.table) == paste('alpha.', years[i], sep = ''))
+    )
+    
+    #Background color, also used to suppress nodes that haven't come up yet
+    #FUTURE - make this reflect total network effectiveness
+    bg.col <- bg.col.defined
+    
+    #Vertices always remain, but edges may be left off
+    g <- graph.data.frame(edge.table[edge.table[, ref[1]], c('A', 'B')],
+                          directed = F,
+                          vertices = vertex.table)
+    
+    #Reduce the curve of edges when there are bipartite edges
+    g.c <- autocurve.edges(g, start = 0.25)
+    
+    v.size <- vertex.table[, ref[2]]
+    
+    #If nodes are too small, put the label next to the node
+    vertex.label.position <- sqrt(v.size)
+    vertex.label.position[vertex.label.position <= 10] <- 1
+    vertex.label.position[vertex.label.position > 10] <- 0
+    
+    v.val <- vertex.table[, ref[3]]
+    
+    #Assignment of one of the 11 palette levels to each node
+    if (sum(v.val < 0) > 0)
+    {
+      breaks.n <- seq(from = min(v.val[v.val < 0]),
+                      to = 0,
+                      length.out = 6)
+    } else
+      breaks.n <- -5:0
+    
+    if (sum(v.val > 0) > 0)
+    {
+      breaks.p <- seq(from = 0,
+                      to = max(v.val[v.val > 0]),
+                      length.out = 6)
+    } else
+      breaks.p <- 0:5
+    
+    breaks <- c(breaks.n, breaks.p[2:6])
+    
+    #Map node values to palette levels
+    v.col <- rep(0, length(v.val))
+    for (j in 1:length(v.col))
+      v.col[j] <-
+      which(abs(breaks - v.val[j]) == min(abs(breaks - v.val[j])))
+    
+    #Assign label colors, which have to be light-colored for the darker colored nodes
+    vertex.label.color <- v.col
+    temp1 <- which(
+      vertex.label.color %in% c(1, 2, 10, 11) &
+        vertex.table[, ref[4]] > 0.5 & vertex.label.position == 0
+    )
+    temp2 <- which(!(
+      vertex.label.color %in% c(1, 2, 10, 11) &
+        vertex.table[, ref[4]] > 0.5 & vertex.label.position == 0
+    ))
+    vertex.label.color[temp1] <- 'black'
+    vertex.label.color[temp2] <- 'black'
+    vertex.label.color <-
+      rgb(data.frame(t(col2rgb(
+        vertex.label.color
+      ) / 255)), alpha = 1)
+#      ) / 255)), alpha = vertex.table[, ref[4]])
+    vertex.label.color[v.size == 0] <- bg.col
+    rm(temp1, temp2)
+    
+    #Node color vector
+    v.col <- pal[v.col]
+    
+    #Suppress non-existent nodes to be the same as the background color
+    v.col[v.size == 0] <- bg.col
+    
+    #Preserve this for the legend without alpha
+    v.col.l <- v.col
+    
+    #Add the alpha channel (but this might not be visible on the final graph)
+    v.col <-
+      rgb(data.frame(t(col2rgb(v.col) / 255)), alpha = vertex.table[, ref[4]])
+    
+    #Regimen label color vector
+    vf.col <- vertex_table$frame ###########Add manually then load
+    vf.col[v.size == 0] <- bg.col
+    
+    #Preserve this for the legend without alpha
+    vf.col.l <- vf.col
+    
+    #Add alpha to the frames
+    vf.col <-
+      rgb(data.frame(t(col2rgb(vf.col) / 255)), alpha = vertex.table[, ref[4]])
+    
+    #Assign transparency to edges
+    e.alpha <- edge.table[, ref[5]]
+    
+    #Edge color vector
+    e.col <- edge.table$e.color[edge.table[, ref[1]]]
+    e.col <- rgb(data.frame(t(col2rgb(e.col) / 255)), alpha = e.alpha)
+    
+    ###################
+    #Write to TIFF file(s)
+    ###################
+    
+    #Create a directory and deposit results there
+    temp <- paste(context, v)
+    if(!dir.exists(temp))
+      dir.create(temp)
+    
+    tiff(
+      filename = paste(getwd(), 
+                       '/', 
+                       # context,
+                       # '/',
+                       temp, 
+                       '/',
+                       context, 
+                       'graph.', 
+                       years[i], 
+                       '.', 
+                       v,
+                       '.tiff', sep = ''),
+      width = 7,
+      height = 7,
+      res = 300,
+      units = 'in',
+      compression = 'lzw'
+    )
+    
+    {
+    par(mar = c(3, 3, 2, 1) + 0.1,
+        bg = bg.col)
+    
+    # for labeling mid 5 regimens 
+    mid_label = as.integer(dim(vertex.table)[1]/2)
+    
+    par(xpd = T, mar = par()$mar + c(5,5,5,5))
+    
+    # Add rank to vertex.table ##here! 
+    temp1 <-
+    data.frame(matrix(
+      data = 0,
+      nrow = dim(vertex.table)[1],
+      ncol = 1
+    ), stringsAsFactors = F)
+    colnames(temp1) <- paste('rank.', years[i], sep = '')
+    vertex.table <- cbind(vertex.table,temp1)
+    k <- 1
+    score <-  round(vertex.table[order(vertex.table[ref[3]], decreasing = T)[1],ref[3]],digits = 2)
+    for (j in 1:dim(vertex.table)[1]){
+      new_score <- round(vertex.table[order(vertex.table[ref[3]], decreasing = T)[j],ref[3]],digits = 2)
+      if(vertex.table[ref[2]] == 0){
+        next
+      }
+      if (new_score < score){
+        k <- k + 1 
+      }
+      vertex.table[which(vertex.table$regimen == vertex.table$regimen[order(vertex.table[ref[3]], decreasing = T)][j]),dim(vertex.table)[2]] <- k
+      score <- new_score
+    }
+    par(bg = 'gray90')
+    plot(
+      g,
+      layout = layout.foo,
+      vertex.size = sqrt(v.size)/10,
+      vertex.color = v.col,
+      vertex.frame.color = vf.col,
+      vertex.label = NA, 
+      # vertex.label = ifelse(
+      #   vertex.table$regimen == vertex.table$regimen[order(vertex.table[ref[3]], decreasing = T)][1] |
+      #     vertex.table$regimen == vertex.table$regimen[order(vertex.table[ref[3]], decreasing = T)][2] |
+      #     vertex.table$regimen == vertex.table$regimen[order(vertex.table[ref[3]], decreasing = T)][3] |
+      #     vertex.table$regimen == vertex.table$regimen[order(vertex.table[ref[3]], decreasing = T)][4] |
+      #     vertex.table$regimen == vertex.table$regimen[order(vertex.table[ref[3]], decreasing = T)][5] |
+      #     vertex.table$regimen == vertex.table$regimen[order(vertex.table[ref[3]])][5] |
+      #     vertex.table$regimen == vertex.table$regimen[order(vertex.table[ref[3]])][4] |
+      #     vertex.table$regimen == vertex.table$regimen[order(vertex.table[ref[3]])][3] |
+      #     vertex.table$regimen == vertex.table$regimen[order(vertex.table[ref[3]])][2] |
+      #     vertex.table$regimen == vertex.table$regimen[order(vertex.table[ref[3]])][1], vertex.table$regimen, NA),
+      # vertex.table[[dim(vertex.table)[2]]]
+      # vertex.label = ifelse(vertex.table$regimen == 'Paclitaxel&Bevacizumab',vertex.table$regimen, NA),
+      # vertex.label.color = vertex.label.color,
+      # vertex.label.cex = log(vertex.table$size) / median(log(vertex.table$size))/2,
+      # vertex.label.dist = vertex.label.position,
+      # edge.color = e.col,
+      # edge.width = sqrt(edge.table$A.pt + edge.table$B.pt) / 10,
+      edge.curved = g.c,
+      main = paste('Fig 2. Regimen Network,', years[i], sep =
+                     ' ')
+    )
+    #vertex.label = vertex.table$num,
+    
+    #Regimen names legend on the right, ordered by descending node value
+    foo <- vertex.table$num[order(v.val[v.size != 0], decreasing = T)]
+    
+    
+    #Paste the node value for each regimen onto the legend
+    
+    foobar <- paste(vertex.table$regimen[order(v.val[v.size != 0], decreasing = T)],
+                    ' (',
+                    round(v.val[order(v.val[v.size != 0], decreasing = T)], digits = 2),
+                    ')',
+                    sep = '')
+    
+    bar <-
+      duplicated(round(vertex.table[, ref[3]][order(vertex.table[, ref[3]][vertex.table[, ref[2]] !=
+                                                                             0],
+                                                    decreasing = T)], digits = 2))
+    
+    foobar[which(bar)] <- paste('(tie)', foobar[which(bar)])
+    foobar <- paste(vertex.table[[dim(vertex.table)[2]]],foobar)
+    
+    # ## Legend only includes top 5 and bottom 5 
+    # a <- foobar[1:5]
+    # b <- foobar[(length(foobar)-4):length(foobar)]
+    # foobar <- append(a,b)
+    
+    # legend(
+    #   x = 'bottomright',
+    #   legend = foobar,
+    #   text.col = 'black',  #vf.col.l[foo],
+    #   # fill = v.col.l[foo],
+    #   border = vf.col.l[foo],
+    #   box.lty = 0,
+    #   cex = 0.5, bg="transparent",
+    #   xpd=TRUE, mar(c(5,5,5,5)),
+    #   inset=c(-0.3,-0.1)
+    # )
+
+    #Heatmap on the left
+    foo <- legend(
+      x = 'left',
+      legend = round(rev(breaks), digits = 1),
+      fill = rev(pal),
+      border = 'black',
+      box.lty = 0,
+      x.intersp = -3.5, cex = 0.5,
+      xpd=TRUE, mar(c(5,5,5,5)),
+      inset=c(-0.05,0)
+    )
+    
+    # frame legend
+    legend(
+         col = bg.col,
+         fill = bg.col,
+         border = c('#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00','black'),
+         legend = c('Chemotherapy',
+                    'Hormonotherapy',
+                    'Hormone + Targeted therapy',
+                    'Chemo + Targeted therapy',
+                    'Chemohormonotherapy',
+                    'No therapy'),
+         x = 'topleft',
+         ncol = 2,
+         pt.cex = 2 * 0.7, cex = 0.5,
+         xpd=TRUE, mar(c(5,5,5,5)),
+         inset=c(-0.1,-0.1)
+         )
+    
+    # node & edge legend
+    legend(
+      col = 'black',
+      legend = c('Regimen','RCT'),
+      x = 'topright',
+      pch = c(19,NA),
+      lty = c(NA,1),
+      cex = 0.5,xpd=TRUE, mar(c(5,5,5,5)),inset=c(0.3,-0.1)
+    )
+    
+    #Add guides to the heatmap (and legend?)
+    text(foo[[1]]$left, foo[[1]]$top + 0.05, 'Better', cex = 0.75)
+    text(foo[[1]]$left, -foo[[1]]$top - 0.05, 'Worse', cex = 0.75)
+    }
+    
+    dev.off()
+    
+  }
+}
+
+# bar chart 
+library(ggplot2)
+data <- data.frame(name = vertex.table$regimen[order(v.val[v.size != 0], decreasing = T)], value = round(v.val[order(v.val[v.size != 0], decreasing = T)], digits = 2))
+
+ggplot(data, aes(x=value)) + 
+  geom_density()
+
+```
+
+###################
+#Evaluation routine
+###################
+
+foo <- make.tables(context,
+                   ideal.edge.flag = F,
+                   ideal.p.flag = F,
+                   include.p.flag = T,
+                   effect.size.flag = T,
+                   aging.flag = T,
+                   prop.flag = T,
+                   refresh.flag = T)
+
+#Make graphs for all years
+make.graphs()
+
+#Make graph for the most recent year, only
+make.graphs(foo, first = length(years))
+
+#TO-DO
+#1. Create outcomes value sets
+#2. Second-generation value propagation
+#3. Change from annual to exact publication dates
+#4. Allow change in outcome measure and results with updates
+#5. Modify output directory name to reflect flag toggle positions
+
+#History of changes, bug fixes, and new features
+
+#Version 7.5.3
+#1. Fixed a bug in the propagation revaluation algorithm
+
+#Version 7.5.2
+#1. Changed $Reference to $pmid
+#2. Changed the format of the input file
+#3. Remove the $Winner variable, given the change in the format of the input file
+
+#Version 7.5.1
+#1. Added a variable to define background color
+
+#Version 7.5
+#1. Started conversion to R Markdown
+#2. Do not apply transparency to regimen labels
+#3. Create a new output directory for the graphs
+
+#Version 7.4
+#1. Fixed a bug where arm order could be affected by choice of flags
+
+#Version 7.3
+#1. Include propagation and refresh flags into the file naming convention
+#2. Allow for three interim updates
+#3. Added TTNT to the RVU valuation table
+
+#Version 7.2.1
+#1. Added ability to include non-numeric p-value of <0.001
+#2. Added TTP and ORR to the RVU valuation table
+
+#Version 7.2
+#1. Made surrogate weights concordant with the ASCO Value Framework
+#2. Removed fade from the legend
+
+#Version 7.1
+#1. Modified make.graphs so that the make.tables object must be passed
+
+#Version 7.0
+#1. Made vertex alpha proportionate to edge-weighted alpha
+#2. Renamed all "temp" variables to something more sensible
+#3. Added versioning to the file names of graphics and other outputs
+#4. Added the ability for there to be a 2nd update (3rd publication)
+
+#Version 6.2
+#1. Enhanced community-finding algorithm code
+
+#Version 6.1
+#1. Changed refresh from absolute to relative
+#2. Added flag for effect size
+
+#Version 6
+#1. Introduced propagation into the make.tables function
+#2. Replaced linear aging with exponential decay aging
+#3. Functionalized make.tables and make.graphs
+#4. Simplified the node valuing routines
+
+#Version 5.2
+#1. Many simplifications to the code
+#2. Included ability to weight contests by p-value
+#3. Fixed major bug issue with the node valuing algorithm
+
+#Version 5.1
+#1. Changed color palette from traffic light to Red-Yellow-Blue
+#2. Introduced node devaluation as a function of edge alpha
+#3. Removed the 10x boost for coloration step
+#4. Fixed a bug with the value calculation when ties are present
+#5. Counter to track number of calculations
+#6. Calculates edge alpha during the calculations, not during the graphing
+
+#Version 5
+#
+#Bugs fixed
+#1. Heatmap changed to remove boxes around individual colors
+#2. Win-win and lose-lose ties in 3+ armed trials were fixed to reset to regular ties
+#
+#Features added
+#1. Generic, not just for CML
+#2. Generates the edges automatically from the list of regimens
+#3. Extend transparency to node number
+#4. Regimen node value added to legend
+#5. Enables user to remove small nodes during the iterative layout process
+
+#Version 4
+#
+#Bugs fixed
+#1. Suppress missing nodes in the legend
+#2. Nodes are refreshed when edges are added
+#3. Node value equation fixed x2
+#
+#Features added
+#1. Transparency as age and paradigm shift
+#2. Extend transparency to node frame and legend
+#3. Orders the legend from highest to lowest-valued node
+
+#Version 3 and earlier
+#
+#Bugs fixed
+#1. Edges no longer add in all at once
+#2. Abbreviations more readable
+#3. Edge curving is recalculated each year
+#4. Heatmap ranges are centered about zero, improving color
+#5. Edges aren't as curved as they were
+#6. Heatmap numbers almost align
+#7. Numbering for small nodes is moved outside of the node
+#8. Pub.date
+#
+#Features added
+#1. Nodes and edges sized by square root
+#2. Heatmap with numbers for min and max
+#3. Transparency as linear function of node age
+
+#Everything below this line is alpha
+###############
+#OPTIONAL: Hide small nodes and recreate edge.table. Doesn't change node sizes.
+#NOT FUNCTIONALIZED
+###############
+
+#Specify the minimum node size
+cutoff <- 100
+
+#Create an old copy of the edge and vertex tables
+edge.table.old <- edge.table
+vertex.table.old <- vertex.table
+
+small.nodes <-
+  vertex.table$regimen[which(vertex.table$size < cutoff)]
+
+edge.table$flag <- T
+a <- which(edge.table$A %in% small.nodes)
+b <- which(edge.table$B %in% small.nodes)
+edge.table$flag[c(a, b)] <- F
+
+edge.table <- edge.table[edge.table$flag, 1:(dim(edge.table)[2] - 1)]
+vertex.table <-
+  vertex.table[!vertex.table$regimen %in% small.nodes, ]
+
+#Re-number the regimens in vertex.table
+vertex.table$num <- 1:dim(vertex.table)[1]
+
+rm(a, b, small.nodes)
+
+#Recreate the full iGraph object
+g <- graph.data.frame(edge.table[, c('A', 'B')],
+                      directed = F,
+                      vertices = vertex.table)
+
+###############
+#OPTIONAL: Keep XX highest and XX lowest valued nodes and recreate edge.table.
+#NOT FUNCTIONALIZED
+###############
+
+#Specify the number of nodes to truncate at
+xx <- 15
+
+#Specify year in which to make the ascertainment (defaulte = most recent)
+yyyy <- years[length(years)]
+  
+#Create an old copy of the edge and vertex tables
+edge.table.old <- edge.table
+vertex.table.old <- vertex.table
+
+temp <- vertex.table[,paste('val.', yyyy, sep='')]
+temp <- order(temp)
+temp <- temp[c(1:xx, (length(temp) - xx + 1):length(temp))]
+
+top.nodes <- vertex.table$regimen[temp]
+
+edge.table$flag <- T
+a <- which(edge.table$A %in% top.nodes)
+b <- which(edge.table$B %in% top.nodes)
+edge.table$flag[c(a, b)] <- F
+
+edge.table <- edge.table[edge.table$flag, 1:(dim(edge.table)[2] - 1)]
+vertex.table <-
+  vertex.table[!vertex.table$regimen %in% top.nodes, ]
+
+#Re-number the regimens in vertex.table
+vertex.table$num <- 1:dim(vertex.table)[1]
+
+rm(a, b, top.nodes, temp)
+
+#Recreate the full iGraph object
+g <- graph.data.frame(edge.table[, c('A', 'B')],
+                      directed = F,
+                      vertices = vertex.table)
+
+#Insert the updated objects back into the parent list
+foo[[1]] <- edge.table
+foo[[2]] <- vertex.table
+years <- foo[[3]]
+foo[[4]] <- g
+
+#Create a vector of graph balance over time
+graph.bal <-
+  colSums(vertex.table[, (5 + length(years)):(4 + 2 * length(years))])
+graph.bal <- sum(graph.bal)
+
+
+rvu.val <- c(1, 1.25, 1.5)
+foo <- make.tables(context)
+edge.table <- foo[[1]]
+years <- foo[[3]]
+
+####################
+#Evaluation routines
+####################
+
+foo <- make.tables(context)
+
+#All flags set to true
+foo <-
+  make.tables(
+    context,
+    include.p.flag = T,
+    aging.flag = T,
+    effect.size.flag=T,
+    prop.flag = T,
+    refresh.flag = T
+  )
+
+foo <-
+  make.tables(
+    context,
+    include.p.flag = T,
+    aging.flag = T,
+    prop.flag = T,
+    refresh.flag = T
+  )
+
+foo <-
+  make.tables(
+    context,
+    include.p.flag = T,
+    aging.flag = T,
+    effect.size.flag = T
+  )
+
+foo <- make.tables(context, include.p.flag = T, aging.flag = T)
+
+foo <- make.tables(context, aging.flag = T)
+
+foo <- make.tables(context)
+
+edge.table <- foo[[1]]
+vertex.table <- foo[[2]]
+years <- foo[[3]]
+g <- foo[[4]]
+
+#Make graphs for all years
+make.graphs(foo)
+
+foo <- make.tables(context,
+                   ideal.edge.flag = F,
+                   ideal.p.flag = F,
+                   include.p.flag = F,
+                   effect.size.flag = F,
+                   aging.flag = F,
+                   prop.flag = F,
+                   refresh.flag = F)
+
+#Just make the last year's graph
+make.graphs(first = length(years))
+
+###################
+#Network power & regimens plot
+###################
+tiff(
+  filename = paste(context, 
+                   'graph.power.', 
+                   years[i], 
+                   '.', 
+                   v,
+                   '.',
+                   prop.flag,
+                   refresh.flag,
+                   '.tiff', sep = ''),
+  width = 9,
+  height = 6,
+  res = 300,
+  units = 'in',
+  compression = 'lzw'
+)
+
+par(mar = c(4, 4, 3, 2) + 0.2)
+
+plot(
+  years,
+  graph.power.max,
+  type = 'l',
+  lwd = 4,
+  col = 'red',
+  ylim = c(0, max(graph.power.max)),
+  xlab = 'Years',
+  ylab = 'Power, no units',
+  main = 'Network Power over Time',
+  cex.lab = 1.5,
+  cex.main = 2
+)
+
+lines(years,
+      graph.power,
+      type = 'l',
+      lwd = 4,
+      col = 'green')
+
+#Legend
+legend(
+  x = 'topleft',
+  fill = c('red', 'green'),
+  inset = 0.01,
+  bg = 'gray95',
+  legend = c('Theoretical Maximum Power', 'Measured Power')
+)
+
+#Sub-title
+mtext(context, side = 3)
+
+dev.off()
+
+
+#Graphs without aging or p-values
+ideal.edge.flag = F
+include.p.flag = F
+ideal.p.flag = F
+aging.flag = F
+
+foo <- make.tables(context)
+edge.table <- foo[[1]]
+vertex.table <- foo[[2]]
+years <- foo[[3]]
+g <- foo[[4]]
+
+make.graphs()
+
+#Graphs with p-values but no aging
+ideal.edge.flag = F
+include.p.flag = T
+ideal.p.flag = F
+aging.flag = F
+
+foo <- make.tables(context)
+edge.table <- foo[[1]]
+vertex.table <- foo[[2]]
+years <- foo[[3]]
+g <- foo[[4]]
+
+make.graphs()
+
+#Graphs with p-values and aging
+ideal.edge.flag = F
+include.p.flag = T
+ideal.p.flag = F
+aging.flag = T
+
+foo <- make.tables(context)
+edge.table <- foo[[1]]
+vertex.table <- foo[[2]]
+years <- foo[[3]]
+g <- foo[[4]]
+
+make.graphs()
+
